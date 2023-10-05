@@ -1,0 +1,114 @@
+def buildNumber = BUILD_NUMBER as int; if (buildNumber > 1) milestone(buildNumber - 1); milestone(buildNumber)
+
+pipeline {
+  agent {
+    kubernetes {
+      yaml """
+        kind: Pod
+        metadata:
+          name: kaniko
+        spec:
+          nodeSelector:
+            pv: jenkins
+          tolerations:
+          - effect: NoSchedule
+            key: pv
+            operator: Equal
+            value: jenkins 
+          containers:
+          - name: jnlp
+            workingDir: /home/jenkins
+          - name: kaniko
+            workingDir: /home/jenkins
+            image: gcr.io/kaniko-project/executor:debug
+            imagePullPolicy: Always
+            command:
+            - /busybox/cat
+            tty: true
+            volumeMounts:
+            - name: docker-config
+              mountPath: /kaniko/.docker/
+            - name: aws-secret
+              mountPath: /root/.aws/
+          - name: docker
+            image: public.ecr.aws/z2l3b7u6/gitlab-ci:latestv1
+            tty: true
+          - name: sonarqube
+            image: sonarsource/sonar-scanner-cli:4.7
+            command: ['/bin/bash']
+            tty: true
+          restartPolicy: Never
+        
+          volumes:
+          - name: docker-config
+            configMap:
+              name: docker-config  
+          - name: aws-secret
+            secret:
+              secretName: aws-secret
+"""
+    }
+  }
+  environment {
+    BUILD_NAME = "$PROJECT_NAME" + "-node-payments"
+    CI_COMMIT_SHA = "$GIT_BRANCH" + "_$GIT_COMMIT"
+    GIT_COMMIT_EMAIL = sh (script: 'git --no-pager show -s --format=\'%ae\'',returnStdout: true).trim()
+    GIT_COMMIT_MSG = sh (script: 'git log -1 --pretty=%B ${GIT_COMMIT}', returnStdout: true).trim()
+  }
+  stages {
+    stage('Jio Node-Payments Dev Build') {
+      when {
+         beforeInput true
+         branch 'jio-dev'
+      }
+      environment{
+        BUILD = "$BUILD_NAME" + "-jio-dev"
+        ECR = "$FW_ECR_URL" + "$BUILD"
+      }
+
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.FW_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'], usernamePassword(credentialsId: "${env.FW_HELM_CREDS}", usernameVariable: 'HELMUNAME', passwordVariable: 'HELMPW'), string(credentialsId: 'VS_CODE_CREDS', variable: 'VS_CREDS'),usernamePassword(credentialsId: "${env.GIT_CREDS}", usernameVariable: 'gitUser', passwordVariable: 'gitPass')]) {
+
+          cache(path: ".npm", key: "$BUILD-${hashFiles('package-lock.json')}" , restoreKeys: ["$BUILD-${hashFiles('package-lock.json')}","$BUILD-"]) {
+        sh ''' 
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $FW_REGION
+          aws eks --region $FW_REGION update-kubeconfig --name Fansportiz
+          helm repo add --username $gitUser --password $gitPass project-1 $FW_HELM_URL_GH/jio-dev/helm-registry
+          helm repo update
+          docker build --network=host --build-arg VS_PASS=$VS_CREDS -t $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA -f devops/Dockerfile.npm-cache .
+          aws ecr get-login-password --region $FW_REGION | docker login --username AWS --password-stdin $FW_ECR_URL
+          docker push $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          helm upgrade -n jio-dev jio-node-payments-dev project-1/jio-node-payments-dev --set=image=$FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          kubectl rollout status -w deployment/jio-node-payments-dev -n jio-dev
+          '''
+          }
+        }
+        container('sonarqube')
+        {
+            sh '''
+                sonar-scanner -D sonar.projectKey=jio-dev-node-payments -D sonar.sources=. -D sonar.host.url=http://15.207.150.121:9000 -D sonar.login=sqp_96dd8a8fa5ff0e2b76e6d6c4259df9a30db2f108
+            '''
+        }         
+      }
+    }
+  }    
+    stage('Updating Jira Status to the Issue') {
+        steps{
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+        script {
+            jiraAddComment comment: "${currentBuild.currentResult}", idOrKey: "${GIT_COMMIT_MSG}", site: 'jira-jenkins'
+          }                    
+        }  
+      }
+    }      
+  }
+    post{
+      always{
+          mail to: "${GIT_COMMIT_EMAIL}",cc: "shubh.kohli@yudiz.com, ravi.kyada@yudiz.com",
+          subject: "Your Pipeline Status For ${JOB_NAME}",
+          body: "Jenkins Build For Job ${env.JOB_NAME} is ${currentBuild.currentResult}:, You can Find More Info. at ${env.BUILD_URL}"
+      }
+    }
+ }

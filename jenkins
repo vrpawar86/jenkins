@@ -1,0 +1,402 @@
+def buildNumber = BUILD_NUMBER as int; if (buildNumber > 1) milestone(buildNumber - 1); milestone(buildNumber)
+
+pipeline {
+  agent {
+    kubernetes {
+      yaml '''
+        apiVersion: v1
+        kind: Pod
+        spec:
+          nodeSelector:
+            pv: jenkins
+          tolerations:
+          - effect: NoSchedule
+            key: pv
+            operator: Equal
+            value: jenkins            
+          containers:
+          - name: docker
+            image: public.ecr.aws/d7h0j7s7/gitlab-ci:latestv2argocd
+            tty: true
+            volumeMounts:
+             - mountPath: /var/run/docker.sock
+               name: docker-sock
+          - name: sonarqube
+            image: sonarsource/sonar-scanner-cli:latest
+            command: ['/bin/bash']
+            tty: true
+            volumeMounts:
+             - mountPath: /var/run/docker.sock
+               name: docker-sock
+          volumes:
+          - name: docker-sock
+            hostPath:
+              path: /var/run/docker.sock   
+        '''
+    }
+  }
+  environment {
+    BUILD_NAME = "$PROJECT_NAME" + "-node-backend"
+    CI_COMMIT_SHA = "$GIT_BRANCH" + "_$GIT_COMMIT" + "tetststs"
+    GIT_COMMIT_EMAIL = sh (script: 'git --no-pager show -s --format=\'%ae\'',returnStdout: true).trim()
+    GIT_COMMIT_MSG = sh (script: 'git log -1 --pretty=%B ${GIT_COMMIT}', returnStdout: true).trim()
+  }
+  stages {
+    stage('fantasy Node-backend Dev Build') {
+      when {
+         beforeInput true
+         branch 'dev'
+      }
+      environment{
+        BUILD = "$BUILD_NAME" + "-$GIT_BRANCH"
+        ECR = "$FW_ECR_URL" + "$BUILD"
+      }
+
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.FW_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'], usernamePassword(credentialsId: "${env.FW_HELM_CREDS}", usernameVariable: 'HELMUNAME', passwordVariable: 'HELMPW'), string(credentialsId: 'VS_CODE_CREDS', variable: 'VS_CREDS')]) {
+
+          cache(path: ".npm", key: "$BUILD-${hashFiles('package-lock.json')}" , restoreKeys: ["$BUILD-${hashFiles('package-lock.json')}","$BUILD-"]) {
+          sh '''
+          mkdir .npm ||true
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $FW_REGION
+          aws eks --region $FW_REGION update-kubeconfig --name Fansportiz
+          aws s3 cp s3://fantasy-firebase-sdk/fantasy-dev-sdk/firebase-sdk.json ./helper/third-party-cred/
+          helm repo add --username $HELMUNAME --password $HELMPW project-1 $FW_HELM_URL
+          helm repo update
+
+          docker build --network=host --build-arg VS_PASS=$VS_CREDS -t $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA -f devops/Dockerfile.vscode.dev .
+          aws ecr get-login-password --region $FW_REGION | docker login --username AWS --password-stdin $FW_ECR_URL
+          docker push $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          helm upgrade -n default $BUILD project-1/$BUILD --set=image=$FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          kubectl rollout status -w deployment/$BUILD -n dev
+          docker rm $BUILD-npm || true
+          docker create --name $BUILD-npm $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          rm -rf .npm
+          docker cp $BUILD-npm:/root/.npm .npm
+          '''
+          }
+        }
+        container('sonarqube')
+        {
+            sh '''
+                sonar-scanner -D sonar.projectKey=fansportiz-node-backend -D sonar.sources=. -D sonar.host.url=http://15.207.150.121:9090 -D sonar.login=6daf3951026ef70e50bdcb7051318b619095c6f5
+            '''
+        }
+      }
+    }
+  }
+  
+    stage('fantasy Node-backend staging Build') {
+      when {
+        beforeInput true
+        branch 'staging'
+      }
+      environment {
+        BUILD = "$BUILD_NAME" + "-stag"
+        BUILD_STAGING = "$BUILD_NAME" + "-staging"
+        ECR = "$FW_ECR_URL" + "$BUILD_STAGING"
+      }
+
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.FW_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'], usernamePassword(credentialsId: "${env.FW_HELM_CREDS}", usernameVariable: 'HELMUNAME', passwordVariable: 'HELMPW'),string(credentialsId: 'VS_CODE_CREDS', variable: 'VS_CREDS')]) {
+            
+          cache(path: ".npm", key: "$BUILD-${hashFiles('package-lock.json')}" , restoreKeys: ["$BUILD-${hashFiles('package-lock.json')}","$BUILD-"]) {
+          sh '''
+          mkdir .npm ||true
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $FW_REGION
+          aws eks --region $FW_REGION update-kubeconfig --name Fansportiz
+          aws s3 cp s3://fantasy-firebase-sdk/fantasy-stag-sdk/firebase-sdk.json ./helper/third-party-cred/
+          helm repo add --username $HELMUNAME --password $HELMPW project-1 $FW_HELM_URL
+          helm repo update
+
+          docker build --network=host --build-arg VS_PASS=$VS_CREDS -t $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA -f devops/Dockerfile.vscode.staging .
+          aws ecr get-login-password --region $FW_REGION | docker login --username AWS --password-stdin $FW_ECR_URL
+          docker push $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          helm upgrade -n default $BUILD project-1/$BUILD_STAGING --set=image=$FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          kubectl rollout status -w deployment/$BUILD -n staging
+          docker rm $BUILD-npm || true
+          docker create --name $BUILD-npm $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          rm -rf .npm
+          docker cp $BUILD-npm:/root/.npm .npm
+          '''
+          }
+        }
+      }
+    }
+  }
+    stage('fantasy Node-Backend Master Build') {
+      when {
+        beforeInput true
+        branch 'master'
+      }
+      options {
+        timeout(time: 2, unit: 'DAYS') 
+      }
+      input {
+        message "Should we continue for Production?"
+        ok "Yes, we should."
+      }
+      environment{
+        BUILD = "$BUILD_NAME"
+        ECR = "$FW_ECR_URL" + "$BUILD"
+      }
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.FW_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'], usernamePassword(credentialsId: "${env.FW_HELM_CREDS}", usernameVariable: 'HELMUNAME', passwordVariable: 'HELMPW')]) {
+
+          sh ''' 
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $FW_REGION
+          aws eks --region $FW_REGION update-kubeconfig --name Fansportiz
+          aws s3 cp s3://fantasy-firebase-sdk/fantasy-prod-sdk/firebase-sdk.json ./helper/third-party-cred/
+          helm repo add --username $HELMUNAME --password $HELMPW project-1 $FW_HELM_URL
+          helm repo update
+
+          docker build --network=host -t $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA -f devops/Dockerfile .
+          aws ecr get-login-password --region $FW_REGION | docker login --username AWS --password-stdin $FW_ECR_URL
+          docker push $FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          helm upgrade -n production $BUILD project-1/$BUILD --set=image=$FW_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA --no-hooks
+          kubectl rollout status -w deployment/$BUILD -n production
+          '''
+        }
+      }
+    }
+  }
+    stage('WAFBR Node-Backend Dev Build') {
+      when {
+          beforeInput true
+          branch 'vrf-dev'
+      }
+      environment{
+        BUILD = "$BUILD_NAME" + "-dev"
+        ECR = "$VRF_ECR_URL" + "$BUILD"
+      }
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.VRF_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],
+            usernamePassword(credentialsId: "${env.VRF_ARGO_CREDS}", usernameVariable: 'ARGOUNAME', passwordVariable: 'ARGOPW'),string(credentialsId: 'VS_CODE_CREDS', variable: 'VS_CREDS')]) {
+
+          cache(path: ".npm", key: "$BUILD-${hashFiles('package-lock.json')}" , restoreKeys: ["$BUILD-${hashFiles('package-lock.json')}","$BUILD-"]) {
+          sh '''
+          mkdir .npm ||true 
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $VRF_REGION
+          aws eks --region $VRF_REGION update-kubeconfig --name waf-br
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-dev/watechnology.pem ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-dev/watechnology.key ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/firebase-sdk.json ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/cartolapix.pem ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/cartolapix.key ./helper/third-party-cred/          
+          argocd login $VRF_ARGO_URL --insecure --username $ARGOUNAME --password $ARGOPW --grpc-web
+
+          docker build --network=host --build-arg VS_PASS=$VS_CREDS -t $VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA . -f devops/Dockerfile.npm-cache
+          aws ecr get-login-password --region $VRF_REGION | docker login --username AWS --password-stdin $VRF_ECR_URL
+          docker push $VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          argocd app set $BUILD -p image=$VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA --grpc-web
+          kubectl rollout status -w deployment/$BUILD -n dev
+          docker rm $BUILD-npm || true
+          docker create --name $BUILD-npm $VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          rm -rf .npm
+          docker cp $BUILD-npm:/root/.npm .npm
+          '''
+          }
+        }
+      }
+    }
+  }
+    stage('WAFBR Node-Backend Stag Build') {
+      when {
+          beforeInput true
+          branch 'vrf-stag'
+      }
+      environment{
+        BUILD = "$BUILD_NAME" + "-stag"
+        ECR = "$VRF_ECR_URL" + "$BUILD"
+      }
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.VRF_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],
+            usernamePassword(credentialsId: "${env.VRF_ARGO_CREDS}", usernameVariable: 'ARGOUNAME', passwordVariable: 'ARGOPW')]) {
+
+          cache(path: ".npm", key: "$BUILD-${hashFiles('package-lock.json')}" , restoreKeys: ["$BUILD-${hashFiles('package-lock.json')}","$BUILD-"]) {
+          sh '''
+          mkdir .npm ||true
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $VRF_REGION
+          aws eks --region $VRF_REGION update-kubeconfig --name waf-br
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-dev/watechnology.pem ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-dev/watechnology.key ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/firebase-sdk.json ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/cartolapix.pem ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/cartolapix.key ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/waf-br-stag-sdk/fansportiz-dc51a-firebase-adminsdk-8j2ab-a19c2e72fc.json ./helper/third-party-cred/
+          argocd login $VRF_ARGO_URL --insecure --username $ARGOUNAME --password $ARGOPW --grpc-web
+
+          docker build --network=host -t $VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA -f devops/Dockerfile.npm-cache .
+          aws ecr get-login-password --region $VRF_REGION | docker login --username AWS --password-stdin $VRF_ECR_URL
+          docker push $VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          argocd app set $BUILD -p image=$VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA --grpc-web
+          kubectl rollout status -w deployment/$BUILD -n staging
+          docker rm $BUILD-npm || true
+          docker create --name $BUILD-npm $VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          rm -rf .npm
+          docker cp $BUILD-npm:/root/.npm .npm
+          '''
+          }
+        }
+      }
+    }
+  }
+    stage('WAFBR Node-Backend Master Build') {
+      when {
+          beforeInput true
+          branch 'vrf-prod'
+      }
+      options {
+        timeout(time: 1, unit: 'DAYS') 
+      }
+      input {
+        message "Should we continue for Production?"
+        ok "Yes, we should."
+      }
+      environment{
+        BUILD = "$BUILD_NAME"
+        ECR = "$VRF_ECR_URL" + "$BUILD"
+      }
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.VRF_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],
+            usernamePassword(credentialsId: "${env.VRF_ARGO_CREDS}", usernameVariable: 'ARGOUNAME', passwordVariable: 'ARGOPW')]) {
+
+          sh ''' 
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $VRF_REGION
+          aws eks --region $VRF_REGION update-kubeconfig --name waf-br
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-prod/watechnology.pem ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-prod/watechnology.key ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/firebase-sdk.json ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/vrf-prod/cartolapix.pem ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/vrf-prod/cartolapix.key ./helper/third-party-cred/
+          aws s3 cp s3://waf-br-firebase-sdk-1638949745/waf-br-stag-sdk/fansportiz-dc51a-firebase-adminsdk-8j2ab-a19c2e72fc.json ./helper/third-party-cred/
+          argocd login $VRF_ARGO_URL --insecure --username $ARGOUNAME --password $ARGOPW --grpc-web
+
+          docker build --network=host -t $VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA -f devops/Dockerfile .
+          aws ecr get-login-password --region $VRF_REGION | docker login --username AWS --password-stdin $VRF_ECR_URL
+          docker push $VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA
+          argocd app set $BUILD -p image=$VRF_ECR_URL$BUILD_NAME:$CI_COMMIT_SHA --grpc-web
+          kubectl rollout status -w deployment/$BUILD -n production
+          '''
+        }
+      }
+    }
+  }
+
+    stage('Kudi Node-Backend Stag Build') {
+      when {
+          beforeInput true
+          branch 'kudi-stag'
+      }
+      environment{
+        BUILD_NAME = "kudi-node-backend"
+        BUILD = "$BUILD_NAME" + "-stag"
+        ECR = "$VRF_ECR_URL" + "waf-br-node-backend"
+      }
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.VRF_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],
+            usernamePassword(credentialsId: "${env.VRF_ARGO_CREDS}", usernameVariable: 'ARGOUNAME', passwordVariable: 'ARGOPW')]) {
+
+          cache(path: ".npm", key: "$BUILD-${hashFiles('package-lock.json')}" , restoreKeys: ["$BUILD-${hashFiles('package-lock.json')}","$BUILD-"]) {
+          sh '''
+          mkdir .npm ||true 
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $VRF_REGION
+          aws eks --region $VRF_REGION update-kubeconfig --name waf-br
+          #aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-dev/watechnology.pem ./helper/third-party-cred/
+          #aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-dev/watechnology.key ./helper/third-party-cred/
+          #aws s3 cp s3://waf-br-firebase-sdk-1638949745/firebase-sdk.json ./helper/third-party-cred/
+          #aws s3 cp s3://waf-br-firebase-sdk-1638949745/waf-br-stag-sdk/fansportiz-dc51a-firebase-adminsdk-8j2ab-a19c2e72fc.json ./helper/third-party-cred/
+          aws s3 cp s3://kudi-firebase-sdk-1638949745/firebase-sdk.json ./helper/third-party-cred/
+          argocd login $VRF_ARGO_URL --insecure --username $ARGOUNAME --password $ARGOPW --grpc-web
+
+          docker build --network=host -t $ECR:$CI_COMMIT_SHA -f devops/Dockerfile.npm-cache .
+          aws ecr get-login-password --region $VRF_REGION | docker login --username AWS --password-stdin $VRF_ECR_URL
+          docker push $ECR:$CI_COMMIT_SHA
+          argocd app set $BUILD -p image=$ECR:$CI_COMMIT_SHA --grpc-web
+          kubectl rollout status -w deployment/$BUILD -n kudi-staging
+          docker rm $BUILD-npm || true
+          docker create --name $BUILD-npm $ECR:$CI_COMMIT_SHA
+          rm -rf .npm
+          docker cp $BUILD-npm:/root/.npm .npm
+          '''
+          }
+          }
+        }
+      }
+    }
+
+    stage('Kudi Node-Backend Master Build Jira') {
+      when {
+          beforeInput true
+          branch 'kudi-prod'
+      }
+      options {
+        timeout(time: 1, unit: 'DAYS') 
+      }
+      input {
+        message "Should we continue for Production?"
+        ok "Yes, we should."
+      }
+      environment{
+        BUILD_NAME = "kudi-node-backend"
+        BUILD = "$BUILD_NAME"
+        ECR = "$VRF_ECR_URL" + "waf-br-node-backend"
+      }
+      steps {
+        container('docker') {
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.VRF_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],
+            usernamePassword(credentialsId: "${env.VRF_ARGO_CREDS}", usernameVariable: 'ARGOUNAME', passwordVariable: 'ARGOPW')]) {
+
+          sh ''' 
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID; aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY; aws configure set default.region $VRF_REGION
+          aws eks --region $VRF_REGION update-kubeconfig --name waf-br
+          #aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-dev/watechnology.pem ./helper/third-party-cred/
+          #aws s3 cp s3://waf-br-firebase-sdk-1638949745/watechnology-dev/watechnology.key ./helper/third-party-cred/
+          #aws s3 cp s3://waf-br-firebase-sdk-1638949745/firebase-sdk.json ./helper/third-party-cred/
+          #aws s3 cp s3://waf-br-firebase-sdk-1638949745/waf-br-stag-sdk/fansportiz-dc51a-firebase-adminsdk-8j2ab-a19c2e72fc.json ./helper/third-party-cred/
+          aws s3 cp s3://kudi-firebase-sdk-1638949745/firebase-sdk.json ./helper/third-party-cred/
+          argocd login $VRF_ARGO_URL --insecure --username $ARGOUNAME --password $ARGOPW --grpc-web
+
+          docker build --network=host -t $ECR:$CI_COMMIT_SHA -f devops/Dockerfile .
+          aws ecr get-login-password --region $VRF_REGION | docker login --username AWS --password-stdin $VRF_ECR_URL
+          docker push $ECR:$CI_COMMIT_SHA
+          argocd app set $BUILD -p image=$ECR:$CI_COMMIT_SHA --grpc-web
+          kubectl rollout status -w deployment/$BUILD -n kudi-production
+          '''
+          }
+        } 
+      }
+    }
+    stage('Updating Jira Status to the Issue') {
+        steps{
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+        script {
+            jiraAddComment comment: "${currentBuild.currentResult}", idOrKey: "${GIT_COMMIT_MSG}", site: 'jira-jenkins'
+          }                    
+        }  
+      }
+    }        
+  }
+    post{
+      always{
+          mail to: "${GIT_COMMIT_EMAIL}",cc: "shubh.kohli@yudiz.com,ravi.kyada@yudiz.com",
+          subject: "Your Pipeline Status For ${JOB_NAME}",
+          body: "Jenkins Build For Job ${env.JOB_NAME} is ${currentBuild.currentResult}:, You can Find More Info. at ${env.BUILD_URL}"
+      }
+    }
+ }
